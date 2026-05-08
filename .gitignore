@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+sdkconfig
+sdkconfig.old
+*.swp
+*.swo
+*~
+
+# Dependencies
+dependencies.lock
+managed_components/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

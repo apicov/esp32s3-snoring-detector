@@ -1,0 +1,5 @@
+dependencies:
+  idf:
+    version: '>=4.1.0'
+  espressif/mqtt: '*'
+  espressif/esp32-camera: '^2.0.13'
