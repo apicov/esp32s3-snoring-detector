@@ -183,61 +183,63 @@ extern "C" void app_main(void)
 
                 ESP_LOGI(TAG, "Captured JPEG image: %zu bytes", jpeg_len);
 
-                // Allocate buffers in PSRAM for image processing
-                constexpr size_t decoded_size = 160 * 120 * 3;  // RGB888: 57,600 bytes
-                constexpr size_t resized_size = 96 * 96 * 3;    // RGB888: 27,648 bytes
-                constexpr size_t b64_size = (4 * ((resized_size + 2) / 3)) + 1;  // ~36,865 bytes
+                // Base64 encode the original JPEG for MQTT transmission
+                size_t jpeg_b64_size = (4 * ((jpeg_len + 2) / 3)) + 1;
+                char* jpeg_b64_buffer = (char*)heap_caps_malloc(jpeg_b64_size, MALLOC_CAP_SPIRAM);
 
-                uint8_t* decoded_buf = (uint8_t*)heap_caps_malloc(decoded_size, MALLOC_CAP_SPIRAM);
-                uint8_t* resized_buf = (uint8_t*)heap_caps_malloc(resized_size, MALLOC_CAP_SPIRAM);
-                char* b64_buffer = (char*)heap_caps_malloc(b64_size, MALLOC_CAP_SPIRAM);
-
-                if (!decoded_buf || !resized_buf || !b64_buffer) {
-                    ESP_LOGE(TAG, "Failed to allocate processing buffers in PSRAM");
-                    heap_caps_free(decoded_buf);
-                    heap_caps_free(resized_buf);
-                    heap_caps_free(b64_buffer);
+                if (!jpeg_b64_buffer) {
+                    ESP_LOGE(TAG, "Failed to allocate base64 buffer for JPEG");
                     return;
                 }
 
-                ESP_LOGI(TAG, "Allocated buffers: decoded=%p, resized=%p, b64=%p (all in PSRAM)",
-                         decoded_buf, resized_buf, b64_buffer);
-
-                // Convert JPEG to RGB888 (160x120)
-                if (!fmt2rgb888(jpeg_data, jpeg_len, PIXFORMAT_JPEG, decoded_buf)) {
-                    ESP_LOGE(TAG, "JPEG to RGB888 conversion failed");
-                    heap_caps_free(decoded_buf);
-                    heap_caps_free(resized_buf);
-                    heap_caps_free(b64_buffer);
-                    return;
-                }
-                ESP_LOGI(TAG, "✓ Decoded JPEG to BGR888 (160x120)");
-
-                // Resize from 160x120 to 96x96 (resizeColorImage already swaps BGR to RGB)
-                resizeColorImage(decoded_buf, 160, 120, resized_buf, 96, 96);
-                ESP_LOGI(TAG, "✓ Resized to 96x96 and converted to RGB");
-
-                // Base64 encode the resized RGB data
                 size_t olen;
                 auto ret = mbedtls_base64_encode(
-                    (unsigned char*)b64_buffer, b64_size, &olen, resized_buf, resized_size);
+                    (unsigned char*)jpeg_b64_buffer, jpeg_b64_size, &olen, jpeg_data, jpeg_len);
 
                 if (ret == 0) {
                     ESP_LOGI(TAG, "✓ Base64 encoded (%zu bytes)", olen);
 
-                    // Publish base64 encoded image via MQTT
+                    // Publish base64 encoded JPEG via MQTT
                     if (mqtt && mqtt->is_connected()) {
-                        mqtt->publish(MQTT_TOPIC, (const uint8_t*)b64_buffer, olen, 1, 0);
-                        ESP_LOGI(TAG, "✓ Sent 96x96 RGB888 image (%zu bytes base64)", olen);
+                        mqtt->publish(MQTT_TOPIC, (const uint8_t*)jpeg_b64_buffer, olen, 0, 0);
+                        ESP_LOGI(TAG, "✓ Sent original JPEG (%zu bytes base64)", olen);
                     }
                 } else {
                     ESP_LOGE(TAG, "Base64 encoding failed");
                 }
 
+                heap_caps_free(jpeg_b64_buffer);
+
+                // Allocate buffers for local processing (96x96 resize)
+                constexpr size_t decoded_size = 160 * 120 * 3;  // RGB888: 57,600 bytes
+                constexpr size_t resized_size = 96 * 96 * 3;    // RGB888: 27,648 bytes
+
+                uint8_t* decoded_buf = (uint8_t*)heap_caps_malloc(decoded_size, MALLOC_CAP_SPIRAM);
+                uint8_t* resized_buf = (uint8_t*)heap_caps_malloc(resized_size, MALLOC_CAP_SPIRAM);
+
+                if (!decoded_buf || !resized_buf) {
+                    ESP_LOGE(TAG, "Failed to allocate processing buffers in PSRAM");
+                    heap_caps_free(decoded_buf);
+                    heap_caps_free(resized_buf);
+                    return;
+                }
+
+                // Convert JPEG to RGB888 (160x120) for local processing
+                if (!fmt2rgb888(jpeg_data, jpeg_len, PIXFORMAT_JPEG, decoded_buf)) {
+                    ESP_LOGE(TAG, "JPEG to RGB888 conversion failed");
+                    heap_caps_free(decoded_buf);
+                    heap_caps_free(resized_buf);
+                    return;
+                }
+                ESP_LOGI(TAG, "✓ Decoded JPEG to BGR888 (160x120)");
+
+                // Resize from 160x120 to 96x96 for local processing (resizeColorImage already swaps BGR to RGB)
+                resizeColorImage(decoded_buf, 160, 120, resized_buf, 96, 96);
+                ESP_LOGI(TAG, "✓ Resized to 96x96 and converted to RGB for local processing");
+
                 // Free PSRAM buffers
                 heap_caps_free(decoded_buf);
                 heap_caps_free(resized_buf);
-                heap_caps_free(b64_buffer);
 
                 ESP_LOGI(TAG, "After processing - Free PSRAM: %lu",
                          heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
