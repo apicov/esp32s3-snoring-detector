@@ -1,33 +1,21 @@
-menu "Camera MQTT Configuration"
+menu "Snoring Detector Configuration"
 
-    config CAM_MQTT_WIFI_SSID
+    config SNORING_WIFI_SSID
         string "WiFi SSID"
         default ""
         help
             SSID (network name) to connect to.
 
-    config CAM_MQTT_WIFI_PASSWORD
+    config SNORING_WIFI_PASSWORD
         string "WiFi Password"
         default ""
         help
             WiFi password (WPA or WPA2).
 
-    config CAM_MQTT_BROKER_URI
+    config SNORING_MQTT_BROKER_URI
         string "MQTT Broker URI"
         default "mqtt://127.0.0.1:1883"
         help
             MQTT broker URI.
-
-    config CAM_MQTT_IMAGE_TOPIC
-        string "MQTT Image Topic"
-        default "/camera/img"
-        help
-            MQTT topic for publishing images.
-
-    config CAM_MQTT_CMD_TOPIC
-        string "MQTT Command Topic"
-        default "/camera/cmd"
-        help
-            MQTT topic for receiving commands.
 
 endmenu
