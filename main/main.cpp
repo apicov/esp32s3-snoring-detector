@@ -27,6 +27,8 @@ static const char *TAG = "snoring_detector";
 
 static MQTTClient *mqtt = nullptr;
 
+void audio_task(void*);
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
@@ -264,6 +266,11 @@ class I2SMicrophone{
 };
 
 
+//Seeed XIAO ESP32S3 Sense, the built-in PDM microphone uses:
+//GPIO 41 → MIC DATA
+//GPIO 42 → MIC CLK (wiki.seeedstudio.com)
+I2SMicrophone mic(GPIO_NUM_42, GPIO_NUM_41, 16000);
+
 
 extern "C" void app_main(void)
 {
@@ -328,7 +335,23 @@ extern "C" void app_main(void)
 */
     ESP_LOGI(TAG, "System ready");
 
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    xTaskCreate(audio_task, "audio", 4096, nullptr, 5, nullptr);
+}
+
+
+
+void audio_task(void*) {
+  while(true){
+    mic.start();
+    auto chunk = mic.get_audio();
+    mic.stop();
+    if(chunk){
+      ESP_LOGI(TAG, "Audio received");
     }
+    else{
+      ESP_LOGI(TAG, "timeout. Audio not received");
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
 }
