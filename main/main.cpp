@@ -146,7 +146,7 @@ class I2SMicrophone{
 
       QueuedAudioChunk first_chunk{nullptr, 0};
       xQueueReceive(empty_audio_queue_, &first_chunk, 0);
-      current_buffer_.reset(first_chunk.buffer);
+      current_buffer_ = first_chunk.buffer;
     }
 
     // Static callback required by the ESP-IDF C API
@@ -167,7 +167,7 @@ class I2SMicrophone{
 
       // If the big buffer is full, hand it off and grab a fresh empty one
       if (self->samples_collected_ >= AUDIO_CHUNK_SIZE) {
-        QueuedAudioChunk full_chunk{self->current_buffer_.release(), self->current_timestamp_};
+        QueuedAudioChunk full_chunk{self->current_buffer_, self->current_timestamp_};
         xQueueSendFromISR(self->audio_queue_, &full_chunk, &higher_priority_task_woken);
 
         //pull a fresh empty buffer to keep recording 
@@ -178,7 +178,7 @@ class I2SMicrophone{
               xQueueReceiveFromISR(self->audio_queue_, &next_chunk, &higher_priority_task_woken);
         }
         self->current_timestamp_ = esp_timer_get_time();
-        self->current_buffer_.reset(next_chunk.buffer);
+        self->current_buffer_ = next_chunk.buffer;
         self->samples_collected_ = 0;
       }
 
@@ -217,7 +217,7 @@ class I2SMicrophone{
     ~I2SMicrophone(){
       if (is_recording_flag_) i2s_channel_disable(rx_handle_);
       if (rx_handle_) i2s_del_channel(rx_handle_);
-
+      delete current_buffer_;
       QueuedAudioChunk chunk{nullptr, 0};
       while (xQueueReceive(audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
       while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
@@ -236,7 +236,7 @@ class I2SMicrophone{
       bool is_recording_flag_ = false;
       QueueHandle_t audio_queue_ = nullptr;
       QueueHandle_t empty_audio_queue_ = nullptr;
-      std::unique_ptr<AudioBuffer> current_buffer_;
+      AudioBuffer* current_buffer_ = nullptr;
       int64_t current_timestamp_ = 0;
       size_t samples_collected_ = 0;
       static constexpr size_t POOL_SIZE = 3;
@@ -245,7 +245,10 @@ class I2SMicrophone{
       void reset_buffers(){
         std::array<AudioBuffer*, POOL_SIZE> buffers{};
         size_t count = 0;
-        if (current_buffer_) buffers[count++] = current_buffer_.release();
+        if (current_buffer_){
+          buffers[count++] = current_buffer_;
+          current_buffer_ = nullptr;
+        }
         // empty queues and save buffers pointers in array
         QueuedAudioChunk chunk{nullptr, 0};
         while (xQueueReceive(audio_queue_, &chunk, 0) == pdTRUE)
@@ -259,7 +262,7 @@ class I2SMicrophone{
         }
         // take one buffer from queue and use it as current
         xQueueReceive(empty_audio_queue_, &chunk, 0);
-        current_buffer_.reset(chunk.buffer);
+        current_buffer_ = chunk.buffer;
         samples_collected_ = 0;
         current_timestamp_ = 0; 
       }
