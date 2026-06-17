@@ -106,12 +106,13 @@ extern "C" void app_main(void)
 
 
 void audio_task(void*) {
+  mic.start();
   while(true){
-    mic.start();
     auto chunk = mic.get_audio();
-    mic.stop();
-    if(chunk){
+    //mic.stop();
+    ip_info(chunk){
       ESP_LOGI(TAG, "Audio received");
+      
     }
     else{
       ESP_LOGI(TAG, "timeout. Audio not received");
