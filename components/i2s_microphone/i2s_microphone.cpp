@@ -1,0 +1,153 @@
+#include "i2s_microphone.hpp"
+#include <cstring>
+#include <memory>
+#include "esp_timer.h"
+
+struct QueuedAudioChunk {
+    AudioBuffer* buffer;
+    int64_t timestamp_us;
+};
+
+I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_rate)
+    : clk_(clk), data_(data), sample_rate_(sample_rate)
+{
+    audio_queue_ = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
+    empty_audio_queue_ = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
+
+    for (int i = 0; i < POOL_SIZE; i++) {
+        auto buffer = std::make_unique<AudioBuffer>();
+        QueuedAudioChunk chunk = { buffer.release(), 0 };
+        xQueueSend(empty_audio_queue_, &chunk, 0);
+    }
+
+    chan_cfg_ = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg_.dma_desc_num = 4;
+    chan_cfg_.dma_frame_num = 1000;
+    i2s_new_channel(&chan_cfg_, nullptr, &rx_handle_);
+
+    pdm_cfg_ = {
+        .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(sample_rate_),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = clk_,
+            .din = data_,
+            .invert_flags = { .clk_inv = false }
+        },
+    };
+    i2s_channel_init_pdm_rx_mode(rx_handle_, &pdm_cfg_);
+
+    i2s_event_callbacks_t cbs = {
+        .on_recv      = I2SMicrophone::on_receive_callback,
+        .on_recv_q_ovf = nullptr,
+        .on_sent      = nullptr,
+        .on_send_q_ovf = nullptr
+    };
+    i2s_channel_register_event_callback(rx_handle_, &cbs, this);
+
+    QueuedAudioChunk first_chunk{nullptr, 0};
+    xQueueReceive(empty_audio_queue_, &first_chunk, 0);
+    current_buffer_ = first_chunk.buffer;
+}
+
+I2SMicrophone::~I2SMicrophone()
+{
+    if (is_recording_flag_) i2s_channel_disable(rx_handle_);
+    if (rx_handle_) i2s_del_channel(rx_handle_);
+    delete current_buffer_;
+    QueuedAudioChunk chunk{nullptr, 0};
+    while (xQueueReceive(audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
+    while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
+}
+
+bool IRAM_ATTR I2SMicrophone::on_receive_callback(i2s_chan_handle_t /*handle*/,
+                                                    i2s_event_data_t* event,
+                                                    void* user_ctx)
+{
+    auto* self = static_cast<I2SMicrophone*>(user_ctx);
+    BaseType_t higher_priority_task_woken = pdFALSE;
+
+    auto* dst = reinterpret_cast<uint8_t*>(self->current_buffer_->data())
+                + self->samples_collected_ * sizeof(int16_t);
+    std::memcpy(dst, event->dma_buf, event->size);
+    self->samples_collected_ += event->size / sizeof(int16_t);
+
+    if (self->samples_collected_ >= AUDIO_CHUNK_SIZE) {
+        QueuedAudioChunk full_chunk{self->current_buffer_, self->current_timestamp_};
+        xQueueSendFromISR(self->audio_queue_, &full_chunk, &higher_priority_task_woken);
+
+        QueuedAudioChunk next_chunk{nullptr, 0};
+        if (xQueueReceiveFromISR(self->empty_audio_queue_, &next_chunk, &higher_priority_task_woken) != pdTRUE){
+            xQueueReceiveFromISR(self->audio_queue_, &next_chunk, &higher_priority_task_woken);
+            self->overwritten_chunk_count_++;
+        }
+
+        self->current_timestamp_ = esp_timer_get_time();
+        self->current_buffer_ = next_chunk.buffer;
+        self->samples_collected_ = 0;
+    }
+
+    return higher_priority_task_woken == pdTRUE;
+}
+
+std::optional<I2SMicrophone::AudioChunkHandle> I2SMicrophone::get_audio()
+{
+    QueuedAudioChunk chunk{nullptr, 0};
+    if (xQueueReceive(audio_queue_, &chunk, pdMS_TO_TICKS(3000)) == pdTRUE)
+        return AudioChunkHandle(this, chunk.buffer, chunk.timestamp_us);
+    return std::nullopt;
+}
+
+void I2SMicrophone::start()
+{
+    if (!is_recording_flag_) {
+        reset_buffers();
+        current_timestamp_ = esp_timer_get_time();
+        i2s_channel_enable(rx_handle_);
+        is_recording_flag_ = true;
+    }
+}
+
+void I2SMicrophone::stop()
+{
+    if (is_recording_flag_) {
+        i2s_channel_disable(rx_handle_);
+        is_recording_flag_ = false;
+    }
+}
+
+void I2SMicrophone::return_buffer(AudioBuffer* buffer)
+{
+    QueuedAudioChunk chunk{buffer, 0};
+    xQueueSend(empty_audio_queue_, &chunk, 0);
+}
+
+uint32_t I2SMicrophone::overwritten_chunk_count() const{
+  return overwritten_chunk_count_;
+}
+
+void I2SMicrophone::reset_overwritten_chunk_count(){
+  overwritten_chunk_count_.store(0);
+}
+
+void I2SMicrophone::reset_buffers()
+{
+    std::array<AudioBuffer*, POOL_SIZE> buffers{};
+    size_t count = 0;
+    if (current_buffer_) {
+        buffers[count++] = current_buffer_;
+        current_buffer_ = nullptr;
+    }
+    QueuedAudioChunk chunk{nullptr, 0};
+    while (xQueueReceive(audio_queue_, &chunk, 0) == pdTRUE)
+        buffers[count++] = chunk.buffer;
+    while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE)
+        buffers[count++] = chunk.buffer;
+    for (size_t i = 0; i < count; i++) {
+        QueuedAudioChunk empty{buffers[i], 0};
+        xQueueSend(empty_audio_queue_, &empty, 0);
+    }
+    xQueueReceive(empty_audio_queue_, &chunk, 0);
+    current_buffer_ = chunk.buffer;
+    samples_collected_ = 0;
+    current_timestamp_ = 0;
+}
