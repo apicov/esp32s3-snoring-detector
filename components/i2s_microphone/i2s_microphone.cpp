@@ -3,6 +3,8 @@
 #include <memory>
 #include "esp_timer.h"
 
+// Internal POD used to pass buffer pointers through FreeRTOS queues.
+// Kept in this translation unit — callers only see AudioChunkHandle.
 struct QueuedAudioChunk {
     AudioBuffer* buffer;
     int64_t timestamp_us;
@@ -11,9 +13,11 @@ struct QueuedAudioChunk {
 I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_rate)
     : clk_(clk), data_(data), sample_rate_(sample_rate)
 {
-    audio_queue_ = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
+    audio_queue_       = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
     empty_audio_queue_ = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
 
+    // Pre-allocate all AudioBuffers and put them in the empty pool.
+    // release() hands raw ownership to the queue; the destructor reclaims them.
     for (int i = 0; i < POOL_SIZE; i++) {
         auto buffer = std::make_unique<AudioBuffer>();
         QueuedAudioChunk chunk = { buffer.release(), 0 };
@@ -21,9 +25,9 @@ I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_ra
     }
 
     chan_cfg_ = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    chan_cfg_.dma_desc_num = 4;
-    chan_cfg_.dma_frame_num = 1000;
-    i2s_new_channel(&chan_cfg_, nullptr, &rx_handle_);
+    chan_cfg_.dma_desc_num = 4;     // number of DMA descriptors (ring buffer depth)
+    chan_cfg_.dma_frame_num = 1000; // samples per DMA interrupt (~62.5 ms at 16 kHz)
+    i2s_new_channel(&chan_cfg_, nullptr, &rx_handle_);  // nullptr = no TX channel
 
     pdm_cfg_ = {
         .clk_cfg  = I2S_PDM_RX_CLK_DEFAULT_CONFIG(sample_rate_),
@@ -37,13 +41,15 @@ I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_ra
     i2s_channel_init_pdm_rx_mode(rx_handle_, &pdm_cfg_);
 
     i2s_event_callbacks_t cbs = {
-        .on_recv      = I2SMicrophone::on_receive_callback,
+        .on_recv       = I2SMicrophone::on_receive_callback,
         .on_recv_q_ovf = nullptr,
-        .on_sent      = nullptr,
+        .on_sent       = nullptr,
         .on_send_q_ovf = nullptr
     };
+    // Pass `this` as user_ctx so the static callback can reach instance state.
     i2s_channel_register_event_callback(rx_handle_, &cbs, this);
 
+    // Grab the first empty buffer so the ISR has somewhere to write immediately.
     QueuedAudioChunk first_chunk{nullptr, 0};
     xQueueReceive(empty_audio_queue_, &first_chunk, 0);
     current_buffer_ = first_chunk.buffer;
@@ -53,9 +59,10 @@ I2SMicrophone::~I2SMicrophone()
 {
     if (is_recording_flag_) i2s_channel_disable(rx_handle_);
     if (rx_handle_) i2s_del_channel(rx_handle_);
+    // Free every buffer still in the pool (current + both queues).
     delete current_buffer_;
     QueuedAudioChunk chunk{nullptr, 0};
-    while (xQueueReceive(audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
+    while (xQueueReceive(audio_queue_,       &chunk, 0) == pdTRUE) delete chunk.buffer;
     while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
 }
 
@@ -66,26 +73,33 @@ bool IRAM_ATTR I2SMicrophone::on_receive_callback(i2s_chan_handle_t /*handle*/,
     auto* self = static_cast<I2SMicrophone*>(user_ctx);
     BaseType_t higher_priority_task_woken = pdFALSE;
 
+    // Append the incoming DMA chunk to the current large buffer.
+    // Cast to uint8_t* for byte-level offset arithmetic before memcpy.
     auto* dst = reinterpret_cast<uint8_t*>(self->current_buffer_->data())
                 + self->samples_collected_ * sizeof(int16_t);
     std::memcpy(dst, event->dma_buf, event->size);
     self->samples_collected_ += event->size / sizeof(int16_t);
 
     if (self->samples_collected_ >= AUDIO_CHUNK_SIZE) {
+        // Buffer is full: push it onto the ready queue for the consumer.
         QueuedAudioChunk full_chunk{self->current_buffer_, self->current_timestamp_};
         xQueueSendFromISR(self->audio_queue_, &full_chunk, &higher_priority_task_woken);
 
+        // Try to grab a fresh empty buffer; if none available, steal the oldest
+        // full one so recording is never interrupted (at the cost of data loss).
         QueuedAudioChunk next_chunk{nullptr, 0};
-        if (xQueueReceiveFromISR(self->empty_audio_queue_, &next_chunk, &higher_priority_task_woken) != pdTRUE){
+        if (xQueueReceiveFromISR(self->empty_audio_queue_, &next_chunk, &higher_priority_task_woken) != pdTRUE) {
             xQueueReceiveFromISR(self->audio_queue_, &next_chunk, &higher_priority_task_woken);
             self->overwritten_chunk_count_++;
         }
 
         self->current_timestamp_ = esp_timer_get_time();
-        self->current_buffer_ = next_chunk.buffer;
+        self->current_buffer_    = next_chunk.buffer;
         self->samples_collected_ = 0;
     }
 
+    // Returning true requests an immediate context switch if a higher-priority
+    // task was unblocked by one of the queue operations above.
     return higher_priority_task_woken == pdTRUE;
 }
 
@@ -100,7 +114,7 @@ std::optional<I2SMicrophone::AudioChunkHandle> I2SMicrophone::get_audio()
 void I2SMicrophone::start()
 {
     if (!is_recording_flag_) {
-        reset_buffers();
+        reset_buffers();  // discard any stale data from a previous run
         current_timestamp_ = esp_timer_get_time();
         i2s_channel_enable(rx_handle_);
         is_recording_flag_ = true;
@@ -121,33 +135,38 @@ void I2SMicrophone::return_buffer(AudioBuffer* buffer)
     xQueueSend(empty_audio_queue_, &chunk, 0);
 }
 
-uint32_t I2SMicrophone::overwritten_chunk_count() const{
-  return overwritten_chunk_count_;
+uint32_t I2SMicrophone::overwritten_chunk_count() const
+{
+    return overwritten_chunk_count_;
 }
 
-void I2SMicrophone::reset_overwritten_chunk_count(){
-  overwritten_chunk_count_.store(0);
+void I2SMicrophone::reset_overwritten_chunk_count()
+{
+    overwritten_chunk_count_.store(0);
 }
 
 void I2SMicrophone::reset_buffers()
 {
+    // Collect every buffer pointer — from the current slot and both queues —
+    // then return them all to the empty pool so the ISR starts clean.
     std::array<AudioBuffer*, POOL_SIZE> buffers{};
     size_t count = 0;
     if (current_buffer_) {
         buffers[count++] = current_buffer_;
-        current_buffer_ = nullptr;
+        current_buffer_  = nullptr;
     }
     QueuedAudioChunk chunk{nullptr, 0};
-    while (xQueueReceive(audio_queue_, &chunk, 0) == pdTRUE)
-        buffers[count++] = chunk.buffer;
-    while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE)
-        buffers[count++] = chunk.buffer;
+    while (xQueueReceive(audio_queue_,       &chunk, 0) == pdTRUE) buffers[count++] = chunk.buffer;
+    while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) buffers[count++] = chunk.buffer;
+
     for (size_t i = 0; i < count; i++) {
         QueuedAudioChunk empty{buffers[i], 0};
         xQueueSend(empty_audio_queue_, &empty, 0);
     }
+
+    // Take one buffer out of the empty pool for the ISR to start filling.
     xQueueReceive(empty_audio_queue_, &chunk, 0);
-    current_buffer_ = chunk.buffer;
+    current_buffer_    = chunk.buffer;
     samples_collected_ = 0;
     current_timestamp_ = 0;
 }

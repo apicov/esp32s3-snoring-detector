@@ -10,12 +10,12 @@ LedStrip::LedStrip(gpio_num_t pin, uint32_t num_leds) : num_leds_(num_leds)
         .strip_gpio_num = static_cast<int>(pin),
         .max_leds = num_leds,
         .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB, // WS2812 uses GRB order, not RGB
         .flags = { .invert_out = false },
     };
     led_strip_rmt_config_t rmt_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000,
+        .resolution_hz = 10 * 1000 * 1000, // 10 MHz — required by the WS2812 timing spec
         .mem_block_symbols = 64,
         .flags = { .with_dma = false },
     };
