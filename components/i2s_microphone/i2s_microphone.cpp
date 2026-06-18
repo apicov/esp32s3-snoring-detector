@@ -10,8 +10,10 @@ struct QueuedAudioChunk {
     int64_t timestamp_us;
 };
 
-I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_rate)
-    : clk_(clk), data_(data), sample_rate_(sample_rate)
+I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_rate,
+                              uint32_t inter_chunk_pause_ms)
+    : clk_(clk), data_(data), sample_rate_(sample_rate),
+      inter_chunk_pause_ms_(inter_chunk_pause_ms)
 {
     audio_queue_       = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
     empty_audio_queue_ = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
@@ -54,10 +56,18 @@ I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_ra
     QueuedAudioChunk first_chunk{nullptr, 0};
     xQueueReceive(empty_audio_queue_, &first_chunk, 0);
     current_buffer_ = first_chunk.buffer;
+
+    if (inter_chunk_pause_ms_ > 0) {
+        chunk_done_sem_ = xSemaphoreCreateBinary();
+        // Priority 6 — one above audio_task (5) so it reacts to chunk completion promptly.
+        xTaskCreate(recorder_task_fn, "mic_rec", 2048, this, 6, &recorder_task_handle_);
+    }
 }
 
 I2SMicrophone::~I2SMicrophone()
 {
+    if (recorder_task_handle_) vTaskDelete(recorder_task_handle_);
+    if (chunk_done_sem_) vSemaphoreDelete(chunk_done_sem_);
     if (is_recording_flag_) i2s_channel_disable(rx_handle_);
     if (rx_handle_) i2s_del_channel(rx_handle_);
     // Free every buffer still in the pool (current + both queues).
@@ -65,6 +75,32 @@ I2SMicrophone::~I2SMicrophone()
     QueuedAudioChunk chunk{nullptr, 0};
     while (xQueueReceive(audio_queue_,       &chunk, 0) == pdTRUE) heap_caps_free(chunk.buffer);
     while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) heap_caps_free(chunk.buffer);
+}
+
+void I2SMicrophone::recorder_task_fn(void* ctx)
+{
+    auto* self = static_cast<I2SMicrophone*>(ctx);
+    while (true) {
+        // Sleep until start() sends a notification.
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        while (self->is_recording_flag_) {
+            // Start a fresh chunk cycle.
+            self->reset_buffers();
+            self->current_timestamp_ = esp_timer_get_time();
+            i2s_channel_enable(self->rx_handle_);
+
+            // Block until the ISR signals that a full chunk is ready.
+            xSemaphoreTake(self->chunk_done_sem_, portMAX_DELAY);
+
+            // Stop DMA so the consumer can process without racing the ISR.
+            i2s_channel_disable(self->rx_handle_);
+
+            // Pause to allow the consumer (e.g. MQTT publish) to finish.
+            if (self->is_recording_flag_)
+                vTaskDelay(pdMS_TO_TICKS(self->inter_chunk_pause_ms_));
+        }
+    }
 }
 
 bool IRAM_ATTR I2SMicrophone::on_receive_callback(i2s_chan_handle_t /*handle*/,
@@ -97,6 +133,13 @@ bool IRAM_ATTR I2SMicrophone::on_receive_callback(i2s_chan_handle_t /*handle*/,
         self->current_timestamp_ = esp_timer_get_time();
         self->current_buffer_    = next_chunk.buffer;
         self->samples_collected_ = 0;
+
+        // In pause mode, wake the recorder task to stop the channel and wait.
+        if (self->chunk_done_sem_) {
+            BaseType_t sem_woken = pdFALSE;
+            xSemaphoreGiveFromISR(self->chunk_done_sem_, &sem_woken);
+            higher_priority_task_woken |= sem_woken;
+        }
     }
 
     // Returning true requests an immediate context switch if a higher-priority
@@ -115,18 +158,26 @@ std::optional<I2SMicrophone::AudioChunkHandle> I2SMicrophone::get_audio()
 void I2SMicrophone::start()
 {
     if (!is_recording_flag_) {
-        reset_buffers();  // discard any stale data from a previous run
-        current_timestamp_ = esp_timer_get_time();
-        i2s_channel_enable(rx_handle_);
         is_recording_flag_ = true;
+        if (recorder_task_handle_) {
+            // Pause mode: notify the recorder task to begin the record/pause cycle.
+            xTaskNotifyGive(recorder_task_handle_);
+        } else {
+            // Continuous mode: enable the channel directly.
+            reset_buffers();
+            current_timestamp_ = esp_timer_get_time();
+            i2s_channel_enable(rx_handle_);
+        }
     }
 }
 
 void I2SMicrophone::stop()
 {
     if (is_recording_flag_) {
-        i2s_channel_disable(rx_handle_);
         is_recording_flag_ = false;
+        i2s_channel_disable(rx_handle_);
+        // Unblock the recorder task if it is waiting on chunk_done_sem_.
+        if (chunk_done_sem_) xSemaphoreGive(chunk_done_sem_);
     }
 }
 

@@ -36,7 +36,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 // Seeed XIAO ESP32S3 Sense: GPIO42 = MIC CLK, GPIO41 = MIC DATA
-I2SMicrophone mic(GPIO_NUM_42, GPIO_NUM_41, 16000);
+// 300 ms pause gives ~2.3 s window for a 2 s chunk publish (~87 % duty cycle).
+I2SMicrophone mic(GPIO_NUM_42, GPIO_NUM_41, 16000, 300);
 
 
 extern "C" void app_main(void)
@@ -106,6 +107,7 @@ void audio_task(void*) {
     // EXT_RAM_BSS_ATTR places this in PSRAM BSS — avoids a 64 KB hit on internal RAM.
     static EXT_RAM_BSS_ATTR AudioMessage msg;
 
+    // start() kicks off the internal record/pause cycle; no need to call it each iteration.
     mic.start();
     while (true) {
         auto chunk = mic.get_audio();

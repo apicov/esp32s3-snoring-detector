@@ -5,6 +5,8 @@
 #include <cstddef>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "driver/i2s_pdm.h"
 #include "hal/gpio_types.h"
 
@@ -22,9 +24,18 @@ using AudioBuffer = std::array<int16_t, AUDIO_CHUNK_SIZE>;
  * consumes it through @c get_audio(), which returns an @c AudioChunkHandle
  * that automatically returns the buffer to the pool on destruction.
  *
- * If the consumer is too slow and no empty buffer is available, the oldest
- * unread full buffer is silently overwritten and @c overwritten_chunk_count_
- * is incremented.
+ * ## Modes
+ *
+ * **Continuous** (@c inter_chunk_pause_ms = 0, default):
+ * The ISR fills buffers back-to-back with no gaps. The caller must consume
+ * chunks fast enough or they will be overwritten.
+ *
+ * **Pause** (@c inter_chunk_pause_ms > 0):
+ * An internal task stops the channel after each chunk, waits the configured
+ * pause, then restarts. The pause gives the caller time to publish or process
+ * without risking buffer overruns. A 300 ms pause is enough to cover a
+ * ~2.2 s MQTT publish of a 2 s chunk over a typical WiFi/internet link,
+ * yielding ~87 % duty cycle.
  *
  * Thread safety: @c start(), @c stop(), @c get_audio() and the overwritten-
  * count accessors are safe to call from a single task. The ISR callback runs
@@ -96,11 +107,16 @@ public:
      *
      * Does not start recording; call @c start() to begin.
      *
-     * @param clk         GPIO for the PDM clock output.
-     * @param data        GPIO for the PDM data input.
-     * @param sample_rate Desired sample rate in Hz (e.g. 16000).
+     * @param clk                  GPIO for the PDM clock output.
+     * @param data                 GPIO for the PDM data input.
+     * @param sample_rate          Desired sample rate in Hz (e.g. 16000).
+     * @param inter_chunk_pause_ms Pause in ms between chunks (0 = continuous).
+     *                             A value of 300 ms gives the consumer ~2.3 s
+     *                             to process each 2 s chunk before the next
+     *                             one starts, preventing buffer overruns.
      */
-    I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_rate);
+    I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_rate,
+                  uint32_t inter_chunk_pause_ms = 0);
 
     /// Stops recording (if active) and releases all I2S and buffer resources.
     ~I2SMicrophone();
@@ -116,10 +132,11 @@ public:
      */
     std::optional<AudioChunkHandle> get_audio();
 
-    /// Start DMA recording. Resets buffer state; idempotent if already running.
+    /// Start recording. In pause mode, kicks off the internal record/pause cycle.
+    /// Idempotent if already running.
     void start();
 
-    /// Stop DMA recording. Idempotent if already stopped.
+    /// Stop recording. Idempotent if already stopped.
     void stop();
 
     /**
@@ -141,6 +158,9 @@ private:
     static bool IRAM_ATTR on_receive_callback(i2s_chan_handle_t handle,
                                                i2s_event_data_t* event,
                                                void* user_ctx);
+
+    /// Internal task driving the record → pause → record cycle (pause mode only).
+    static void recorder_task_fn(void* ctx);
 
     /// Drain both queues and refill the empty pool; used before (re)starting.
     void reset_buffers();
@@ -164,4 +184,9 @@ private:
 
     static constexpr size_t POOL_SIZE{3};    ///< Total number of AudioBuffers in the pool.
     std::atomic<uint32_t> overwritten_chunk_count_{0};
+
+    uint32_t inter_chunk_pause_ms_{0};       ///< 0 = continuous, >0 = pause-mode.
+    /// Given by ISR when a chunk completes; taken by recorder task to trigger disable+pause.
+    SemaphoreHandle_t chunk_done_sem_{nullptr};
+    TaskHandle_t recorder_task_handle_{nullptr};
 };

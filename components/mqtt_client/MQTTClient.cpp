@@ -46,8 +46,8 @@ MQTTClient::MQTTClient(const char* mqtt_broker_uri)
     // Save global instance for callbacks
     g_mqtt_instance = this;
 
-    // Initialize lwmqtt (buffer_size=2048, command_timeout=10s, core=0 for unicore)
-    esp_mqtt_init(status_callback, message_callback, 2048, 10000, 0);
+    // Initialize lwmqtt (buffer_size=65536, command_timeout=10s, core=0 for unicore)
+    esp_mqtt_init(status_callback, message_callback, 65536, 10000, 0);
 
     // Start connection
     char port_str[8];
