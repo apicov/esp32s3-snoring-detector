@@ -36,8 +36,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 // Seeed XIAO ESP32S3 Sense: GPIO42 = MIC CLK, GPIO41 = MIC DATA
-// 300 ms pause gives ~2.3 s window for a 2 s chunk publish (~87 % duty cycle).
-I2SMicrophone mic(GPIO_NUM_42, GPIO_NUM_41, 16000, 300);
+// 1000 ms pause gives ~3 s window for a 2 s chunk publish, leaving headroom for other tasks.
+I2SMicrophone mic(GPIO_NUM_42, GPIO_NUM_41, 16000, 1000);
 
 
 extern "C" void app_main(void)
