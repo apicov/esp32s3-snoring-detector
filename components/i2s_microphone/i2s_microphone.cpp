@@ -1,7 +1,7 @@
 #include "i2s_microphone.hpp"
 #include <cstring>
-#include <memory>
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 // Internal POD used to pass buffer pointers through FreeRTOS queues.
 // Kept in this translation unit — callers only see AudioChunkHandle.
@@ -16,11 +16,12 @@ I2SMicrophone::I2SMicrophone(gpio_num_t clk, gpio_num_t data, uint32_t sample_ra
     audio_queue_       = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
     empty_audio_queue_ = xQueueCreate(POOL_SIZE, sizeof(QueuedAudioChunk));
 
-    // Pre-allocate all AudioBuffers and put them in the empty pool.
-    // release() hands raw ownership to the queue; the destructor reclaims them.
+    // Pre-allocate all AudioBuffers in PSRAM to avoid exhausting internal heap.
     for (int i = 0; i < POOL_SIZE; i++) {
-        auto buffer = std::make_unique<AudioBuffer>();
-        QueuedAudioChunk chunk = { buffer.release(), 0 };
+        auto* buffer = static_cast<AudioBuffer*>(
+            heap_caps_malloc(sizeof(AudioBuffer), MALLOC_CAP_SPIRAM));
+        assert(buffer && "Failed to allocate audio buffer in PSRAM");
+        QueuedAudioChunk chunk = { buffer, 0 };
         xQueueSend(empty_audio_queue_, &chunk, 0);
     }
 
@@ -60,10 +61,10 @@ I2SMicrophone::~I2SMicrophone()
     if (is_recording_flag_) i2s_channel_disable(rx_handle_);
     if (rx_handle_) i2s_del_channel(rx_handle_);
     // Free every buffer still in the pool (current + both queues).
-    delete current_buffer_;
+    heap_caps_free(current_buffer_);
     QueuedAudioChunk chunk{nullptr, 0};
-    while (xQueueReceive(audio_queue_,       &chunk, 0) == pdTRUE) delete chunk.buffer;
-    while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) delete chunk.buffer;
+    while (xQueueReceive(audio_queue_,       &chunk, 0) == pdTRUE) heap_caps_free(chunk.buffer);
+    while (xQueueReceive(empty_audio_queue_, &chunk, 0) == pdTRUE) heap_caps_free(chunk.buffer);
 }
 
 bool IRAM_ATTR I2SMicrophone::on_receive_callback(i2s_chan_handle_t /*handle*/,

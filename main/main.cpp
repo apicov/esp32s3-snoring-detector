@@ -1,9 +1,11 @@
+#include <cstring>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "MQTTClient.hpp"
 #include "led_ctl.hpp"
@@ -41,10 +43,7 @@ extern "C" void app_main(void)
 {
     LedStrip leds{GPIO_NUM_1, 8};
     leds.set(0, 0, 0, 32);  // dim blue while booting
-    leds.set(1, 0, 0, 32);  // dim blue while booting
-    leds.set(2, 0, 0, 32);  // dim blue while booting
     leds.show();
-
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -53,8 +52,8 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /*
     ESP_LOGI(TAG, "Initializing WiFi...");
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -67,24 +66,18 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     wifi_config_t wifi_config = {};
-    memcpy(wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    memcpy(wifi_config.sta.ssid,     WIFI_SSID,     sizeof(wifi_config.sta.ssid));
     memcpy(wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password));
+    wifi_config.sta.pmf_cfg = { .capable = true, .required = false };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG, "WiFi started, connecting...");
-
-    if (esp_psram_is_initialized()) {
-        ESP_LOGI(TAG, "PSRAM: %d bytes", esp_psram_get_size());
-    } else {
-        ESP_LOGE(TAG, "PSRAM not initialized");
-        return;
-    }
 
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     mqtt = new MQTTClient(MQTT_URI);
 
-    mqtt->on_connect([](auto _) {
+    mqtt->on_connect([](auto) {
         ESP_LOGI(TAG, "MQTT connected");
     });
 
@@ -96,28 +89,42 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "MQTT ready");
         leds.set(0, 0, 32, 0);  // dim green = ready
         leds.show();
+    } else {
+        ESP_LOGE(TAG, "MQTT connection failed");
     }
-*/
-    ESP_LOGI(TAG, "System ready");
 
     xTaskCreate(audio_task, "audio", 4096, nullptr, 5, nullptr);
 }
 
 
+struct __attribute__((packed)) AudioMessage {
+    int64_t timestamp_us;
+    int16_t samples[AUDIO_CHUNK_SIZE];
+};
 
 void audio_task(void*) {
-  mic.start();
-  while(true){
-    auto chunk = mic.get_audio();
-    //mic.stop();
-    ip_info(chunk){
-      ESP_LOGI(TAG, "Audio received");
-      
+    // EXT_RAM_BSS_ATTR places this in PSRAM BSS — avoids a 64 KB hit on internal RAM.
+    static EXT_RAM_BSS_ATTR AudioMessage msg;
+
+    mic.start();
+    while (true) {
+        auto chunk = mic.get_audio();
+        if (!chunk) {
+            ESP_LOGW(TAG, "Audio timeout");
+            continue;
+        }
+        if (mqtt && mqtt->is_connected()) {
+            msg.timestamp_us = chunk->timestamp_us();
+            memcpy(msg.samples, chunk->buffer().data(), sizeof(msg.samples));
+
+            mqtt->publish("audio/raw",
+                          reinterpret_cast<const uint8_t*>(&msg), sizeof(msg),
+                          0, 0);
+            ESP_LOGI(TAG, "Published chunk: ts=%" PRId64 " us, dropped=%lu",
+                     msg.timestamp_us, mic.overwritten_chunk_count());
+        } else {
+            ESP_LOGW(TAG, "MQTT not connected, dropping chunk");
+        }
+        // chunk goes out of scope here, returning the buffer to the pool automatically
     }
-    else{
-      ESP_LOGI(TAG, "timeout. Audio not received");
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(3000));
-  }
 }
